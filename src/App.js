@@ -1,74 +1,62 @@
 import { useState, useMemo } from "react";
 
-const DEFAULT_TEXT = "The quick brown fox jumps over the lazy dog near the river bank";
+const DEFAULT_INPUT = `[
+  ["\\u010a", 9.5],
+  ["You", 1.0],
+  ["\\u0120are", 0.9],
+  ["\\u0120a", 4.0],
+  ["\\u0120helpful", 2.5],
+  ["\\u0120assistant", 1.8],
+  [".\\u010a", 1.4],
+  ["Command", 11.1],
+  [":\\u010a", 7.3],
+  ["Go", 19.6],
+  ["\\u0120press", 16.6],
+  ["\\u0120that", 8.4],
+  ["\\u0120switch", 12.0]
+]`;
 
-const DEFAULT_SALIENCY = {
-  "The": 0.1, "quick": 0.85, "brown": 0.6, "fox": 0.95,
-  "jumps": 0.75, "over": 0.2, "the": 0.05, "lazy": 0.8,
-  "dog": 0.9, "near": 0.3, "river": 0.55, "bank": 0.45
-};
+// Clean GPT-style unicode artifacts from a token string:
+// \u0120 (Ġ) = space prefix, \u010a (Ċ) = newline
+function cleanToken(tok) {
+  // Replace Ġ (U+0120) with a space, Ċ (U+010A) with newline
+  return tok
+    .replace(/\u0120/g, " ")
+    .replace(/\u010a/g, "\n");
+}
 
-function interpolateColor(value, colormap) {
-  if (colormap === "fire") {
-    const stops = [
-      [0, [15, 15, 30]],
-      [0.25, [180, 20, 20]],
-      [0.5, [230, 100, 10]],
-      [0.75, [255, 210, 50]],
-      [1, [255, 255, 220]],
-    ];
-    for (let i = 0; i < stops.length - 1; i++) {
-      const [t0, c0] = stops[i];
-      const [t1, c1] = stops[i + 1];
-      if (value >= t0 && value <= t1) {
-        const t = (value - t0) / (t1 - t0);
-        return c0.map((c, j) => Math.round(c + t * (c1[j] - c)));
-      }
-    }
-    return [255, 255, 220];
-  }
-  if (colormap === "cool") {
-    const stops = [
-      [0, [10, 15, 50]],
-      [0.33, [20, 80, 150]],
-      [0.66, [30, 180, 200]],
-      [1, [220, 250, 255]],
-    ];
-    for (let i = 0; i < stops.length - 1; i++) {
-      const [t0, c0] = stops[i];
-      const [t1, c1] = stops[i + 1];
-      if (value >= t0 && value <= t1) {
-        const t = (value - t0) / (t1 - t0);
-        return c0.map((c, j) => Math.round(c + t * (c1[j] - c)));
-      }
-    }
-    return [220, 250, 255];
-  }
-  if (colormap === "diverging") {
-    if (value < 0.5) {
-      const t = value / 0.5;
-      return [Math.round(30 + t * 225), Math.round(100 + t * 155), Math.round(200 + t * 55)];
-    } else {
-      const t = (value - 0.5) / 0.5;
-      return [255, Math.round(255 - t * 200), Math.round(255 - t * 230)];
-    }
-  }
-  // green
+// Parse the cleaned token into renderable segments: array of {type: 'text'|'space'|'newline', value}
+function tokenSegments(raw) {
+  const cleaned = cleanToken(raw);
+  // Split on newlines to get segments
+  const parts = cleaned.split("\n");
+  const segments = [];
+  parts.forEach((part, i) => {
+    if (part.length > 0) segments.push({ type: "text", value: part });
+    if (i < parts.length - 1) segments.push({ type: "newline" });
+  });
+  return segments;
+}
+
+function interpolateColor(norm) {
+  // White (low) → orange → deep red (high)
+  // norm in [0, 1]
   const stops = [
-    [0, [20, 20, 20]],
-    [0.4, [30, 100, 60]],
-    [0.7, [50, 190, 100]],
-    [1, [200, 255, 180]],
+    [0,    [248, 248, 245]],
+    [0.3,  [255, 235, 210]],
+    [0.55, [255, 180, 100]],
+    [0.8,  [230, 90,  40]],
+    [1.0,  [160, 20,  10]],
   ];
   for (let i = 0; i < stops.length - 1; i++) {
     const [t0, c0] = stops[i];
     const [t1, c1] = stops[i + 1];
-    if (value >= t0 && value <= t1) {
-      const t = (value - t0) / (t1 - t0);
+    if (norm >= t0 && norm <= t1) {
+      const t = (t1 === t0) ? 0 : (norm - t0) / (t1 - t0);
       return c0.map((c, j) => Math.round(c + t * (c1[j] - c)));
     }
   }
-  return [200, 255, 180];
+  return [160, 20, 10];
 }
 
 function luminance([r, g, b]) {
@@ -76,205 +64,176 @@ function luminance([r, g, b]) {
 }
 
 export default function App() {
-  const [inputText, setInputText] = useState(DEFAULT_TEXT);
-  const [inputSaliency, setInputSaliency] = useState(JSON.stringify(DEFAULT_SALIENCY, null, 2));
-  const [colormap, setColormap] = useState("fire");
+  const [inputJson, setInputJson] = useState(DEFAULT_INPUT);
   const [error, setError] = useState(null);
-  const [hoveredToken, setHoveredToken] = useState(null);
+  const [hoveredIdx, setHoveredIdx] = useState(null);
 
-  const { tokens, saliencyMap, min, max } = useMemo(() => {
+  const { pairs, min, max } = useMemo(() => {
     try {
-      const rawMap = JSON.parse(inputSaliency);
-      // Strip keys that are purely control/non-printable characters (e.g. \u010a newline artifacts)
-      const map = Object.fromEntries(
-        Object.entries(rawMap).filter(([k]) =>
-          k.trim().length > 0 && !/^[\u0000-\u001f\u007f-\u00ff]+$/.test(k)
-        )
-      );
+      const parsed = JSON.parse(inputJson);
+      if (!Array.isArray(parsed)) throw new Error("Expected a JSON array");
+      const pairs = parsed.map(([tok, val]) => ({ raw: tok, value: val }));
+      const vals = pairs.map(p => p.value).filter(v => typeof v === "number");
       setError(null);
-      const vals = Object.values(map).filter((v) => typeof v === "number");
-      const mn = Math.min(...vals);
-      const mx = Math.max(...vals);
-      // Tokenize: split into newlines, spaces, and words — preserving all whitespace
-      const toks = inputText.match(/\n|[^\S\n]+|\S+/g) || [];
-      return { tokens: toks, saliencyMap: map, min: mn, max: mx };
+      return { pairs, min: Math.min(...vals), max: Math.max(...vals) };
     } catch (e) {
-      setError("Invalid JSON in saliency dictionary");
-      return { tokens: [], saliencyMap: {}, min: 0, max: 1 };
+      setError(e.message);
+      return { pairs: [], min: 0, max: 1 };
     }
-  }, [inputText, inputSaliency]);
+  }, [inputJson]);
 
   const range = max - min || 1;
-  const colormaps = ["fire", "cool", "green", "diverging"];
+
+  const hoveredPair = hoveredIdx !== null ? pairs[hoveredIdx] : null;
 
   return (
     <div style={{
-      fontFamily: "'Georgia', 'Times New Roman', serif",
-      background: "#0d0d0f",
+      fontFamily: "'Inter', 'Helvetica Neue', sans-serif",
+      background: "#ffffff",
       minHeight: "100vh",
-      color: "#e8e4dc",
-      padding: "0",
+      color: "#1a1a1a",
     }}>
       {/* Header */}
       <div style={{
-        borderBottom: "1px solid #2a2a30",
-        padding: "24px 40px 20px",
+        borderBottom: "1px solid #e0ddd8",
+        padding: "20px 36px",
         display: "flex",
         alignItems: "baseline",
-        gap: "16px",
+        gap: "14px",
+        background: "#fff",
       }}>
-        <h1 style={{
-          margin: 0, fontSize: "22px", fontWeight: 400,
-          letterSpacing: "0.08em", color: "#f0ebe0", fontFamily: "'Georgia', serif",
-        }}>
-          SALIENCY VIEWER
+        <h1 style={{ margin: 0, fontSize: "18px", fontWeight: 600, letterSpacing: "0.01em", color: "#111" }}>
+          Saliency Viewer
         </h1>
-        <span style={{ fontSize: "11px", color: "#555", letterSpacing: "0.15em", textTransform: "uppercase" }}>
-          token attribution heatmap
+        <span style={{ fontSize: "11px", color: "#aaa", letterSpacing: "0.1em", textTransform: "uppercase" }}>
+          token attribution
         </span>
       </div>
 
-      <div style={{ display: "flex", minHeight: "calc(100vh - 65px)" }}>
+      <div style={{ display: "flex", minHeight: "calc(100vh - 61px)" }}>
         {/* Sidebar */}
         <div style={{
-          width: "300px", flexShrink: 0, borderRight: "1px solid #1e1e24",
-          padding: "28px 24px", display: "flex", flexDirection: "column", gap: "24px",
+          width: "320px", flexShrink: 0,
+          borderRight: "1px solid #e0ddd8",
+          padding: "24px 20px",
+          display: "flex", flexDirection: "column", gap: "20px",
+          background: "#fff",
         }}>
-          {/* Colormap */}
           <div>
-            <label style={{ fontSize: "10px", letterSpacing: "0.18em", color: "#666", textTransform: "uppercase", display: "block", marginBottom: "10px" }}>
-              Colormap
-            </label>
-            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-              {colormaps.map((cm) => {
-                const swatch = [0, 0.33, 0.66, 1].map((v) => {
-                  const [r, g, b] = interpolateColor(v, cm);
-                  return `rgb(${r},${g},${b})`;
-                });
-                return (
-                  <button key={cm} onClick={() => setColormap(cm)} title={cm} style={{
-                    border: colormap === cm ? "1px solid #aaa" : "1px solid #333",
-                    borderRadius: "4px", overflow: "hidden", cursor: "pointer",
-                    padding: 0, width: "56px", height: "28px",
-                    background: `linear-gradient(to right, ${swatch.join(", ")})`,
-                    opacity: colormap === cm ? 1 : 0.5, transition: "opacity 0.2s",
-                  }} />
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Input text */}
-          <div>
-            <label style={{ fontSize: "10px", letterSpacing: "0.18em", color: "#666", textTransform: "uppercase", display: "block", marginBottom: "8px" }}>
-              Input Text
+            <label style={{ fontSize: "10px", letterSpacing: "0.14em", color: "#888", textTransform: "uppercase", display: "block", marginBottom: "8px", fontWeight: 600 }}>
+              Token–Value Pairs (JSON array)
             </label>
             <textarea
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
+              value={inputJson}
+              onChange={(e) => setInputJson(e.target.value)}
               style={{
-                width: "100%", height: "120px", background: "#111115",
-                border: "1px solid #252530", color: "#c8c4bc",
-                fontFamily: "monospace", fontSize: "12px", padding: "10px",
-                resize: "vertical", borderRadius: "4px", outline: "none",
-                boxSizing: "border-box",
+                width: "100%", height: "420px",
+                background: "#fafaf8",
+                border: error ? "1px solid #d94f3c" : "1px solid #ddd",
+                color: "#333",
+                fontFamily: "monospace", fontSize: "11px",
+                padding: "10px", resize: "vertical",
+                borderRadius: "6px", outline: "none",
+                boxSizing: "border-box", lineHeight: "1.5",
               }}
             />
-          </div>
-
-          {/* Saliency dict */}
-          <div style={{ flex: 1 }}>
-            <label style={{ fontSize: "10px", letterSpacing: "0.18em", color: "#666", textTransform: "uppercase", display: "block", marginBottom: "8px" }}>
-              Saliency Dictionary (JSON)
-            </label>
-            <textarea
-              value={inputSaliency}
-              onChange={(e) => setInputSaliency(e.target.value)}
-              style={{
-                width: "100%", height: "200px", background: "#111115",
-                border: error ? "1px solid #c04040" : "1px solid #252530",
-                color: "#c8c4bc", fontFamily: "monospace", fontSize: "11px",
-                padding: "10px", resize: "vertical", borderRadius: "4px",
-                outline: "none", boxSizing: "border-box",
-              }}
-            />
-            {error && <p style={{ color: "#c04040", fontSize: "11px", margin: "6px 0 0" }}>{error}</p>}
+            {error && <p style={{ color: "#d94f3c", fontSize: "11px", margin: "6px 0 0" }}>⚠ {error}</p>}
           </div>
 
           {/* Legend */}
           <div>
-            <label style={{ fontSize: "10px", letterSpacing: "0.18em", color: "#666", textTransform: "uppercase", display: "block", marginBottom: "8px" }}>
+            <label style={{ fontSize: "10px", letterSpacing: "0.14em", color: "#888", textTransform: "uppercase", display: "block", marginBottom: "8px", fontWeight: 600 }}>
               Scale
             </label>
             <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-              <span style={{ fontSize: "10px", color: "#555", fontFamily: "monospace" }}>{min.toFixed(2)}</span>
+              <span style={{ fontSize: "10px", color: "#999", fontFamily: "monospace" }}>{min.toFixed(2)}</span>
               <div style={{
-                flex: 1, height: "10px", borderRadius: "3px",
+                flex: 1, height: "10px", borderRadius: "4px",
                 background: `linear-gradient(to right, ${[0, 0.25, 0.5, 0.75, 1].map(v => {
-                  const [r, g, b] = interpolateColor(v, colormap);
+                  const [r, g, b] = interpolateColor(v);
                   return `rgb(${r},${g},${b})`;
                 }).join(", ")})`,
+                border: "1px solid #e0ddd8",
               }} />
-              <span style={{ fontSize: "10px", color: "#555", fontFamily: "monospace" }}>{max.toFixed(2)}</span>
+              <span style={{ fontSize: "10px", color: "#999", fontFamily: "monospace" }}>{max.toFixed(2)}</span>
             </div>
+          </div>
+
+          {/* Hovered token info */}
+          <div style={{
+            background: "#f5f4f0", borderRadius: "6px", padding: "12px 14px",
+            minHeight: "56px", fontSize: "12px", color: "#555",
+          }}>
+            {hoveredPair ? (
+              <>
+                <div style={{ fontFamily: "monospace", color: "#222", fontSize: "13px", marginBottom: "4px" }}>
+                  "{hoveredPair.raw}"
+                </div>
+                <div>value: <span style={{ color: "#c0401a", fontWeight: 600 }}>{hoveredPair.value.toFixed(4)}</span></div>
+              </>
+            ) : (
+              <span style={{ color: "#bbb" }}>Hover over a token</span>
+            )}
           </div>
         </div>
 
         {/* Main viz */}
-        <div style={{ flex: 1, padding: "40px 48px" }}>
-          <div style={{ marginBottom: "20px", fontFamily: "monospace", fontSize: "12px", color: "#888", height: "18px" }}>
-            {hoveredToken ? (
-              <>
-                <span style={{ color: "#ccc" }}>{hoveredToken.token}</span>
-                {hoveredToken.value !== null && hoveredToken.value !== undefined
-                  ? <span> → <span style={{ color: "#f0d080" }}>{hoveredToken.value.toFixed(4)}</span></span>
-                  : <span style={{ color: "#555" }}> → not in dictionary</span>
-                }
-              </>
-            ) : null}
-          </div>
-
-          <div style={{ lineHeight: "2.4", fontSize: "20px", letterSpacing: "0.02em", fontFamily: "'Georgia', serif" }}>
-            {tokens.map((tok, i) => {
-              // Newline → line break
-              if (tok === "\n") return <br key={i} />;
-              // Spaces/tabs (not newline) → preserve as-is
-              if (/^[^\S\n]+$/.test(tok)) return <span key={i} style={{ whiteSpace: "pre" }}>{tok}</span>;
-
-              // Word token: look up in saliency map, also try stripping punctuation
-              const clean = tok.replace(/[^a-zA-Z0-9']/g, "");
-              const raw = saliencyMap[tok] ?? saliencyMap[clean] ?? null;
-              const norm = raw !== null ? (raw - min) / range : null;
-              const [r, g, b] = norm !== null ? interpolateColor(norm, colormap) : [40, 40, 45];
+        <div style={{ flex: 1, padding: "36px 48px" }}>
+          <div style={{
+            lineHeight: "2.6",
+            fontSize: "19px",
+            fontFamily: "'Georgia', serif",
+            color: "#111",
+          }}>
+            {pairs.map((pair, i) => {
+              const norm = (pair.value - min) / range;
+              const [r, g, b] = interpolateColor(norm);
               const lum = luminance([r, g, b]);
-              const textColor = lum > 140 ? "#0d0d0f" : "#f0ebe0";
-              const isHovered = hoveredToken?.index === i;
+              const textColor = lum < 140 ? "#fff" : "#111";
+              const isHovered = hoveredIdx === i;
+              const segs = tokenSegments(pair.raw);
 
-              return (
-                <span
-                  key={i}
-                  onMouseEnter={() => setHoveredToken({ token: tok, value: raw, index: i })}
-                  onMouseLeave={() => setHoveredToken(null)}
-                  style={{
-                    background: `rgb(${r},${g},${b})`,
-                    color: textColor,
-                    padding: "2px 5px",
-                    borderRadius: "3px",
-                    cursor: "default",
-                    display: "inline-block",
-                    transition: "transform 0.1s, box-shadow 0.1s",
-                    transform: isHovered ? "translateY(-2px)" : "none",
-                    boxShadow: isHovered ? `0 4px 16px rgba(${r},${g},${b},0.5)` : "none",
-                  }}
-                >
-                  {tok}
-                </span>
-              );
+              return segs.map((seg, si) => {
+                if (seg.type === "newline") return <br key={`${i}-${si}`} />;
+                if (seg.type === "text") {
+                  // leading space is part of the text — render the token as one highlighted span
+                  // but trim leading space out of the highlight box, render it separately
+                  const hasLeadingSpace = seg.value.startsWith(" ");
+                  const displayText = hasLeadingSpace ? seg.value.slice(1) : seg.value;
+
+                  return (
+                    <span key={`${i}-${si}`}>
+                      {hasLeadingSpace && <span> </span>}
+                      <span
+                        onMouseEnter={() => setHoveredIdx(i)}
+                        onMouseLeave={() => setHoveredIdx(null)}
+                        style={{
+                          background: `rgb(${r},${g},${b})`,
+                          color: textColor,
+                          padding: "2px 4px",
+                          borderRadius: "3px",
+                          cursor: "default",
+                          display: "inline-block",
+                          transition: "box-shadow 0.15s, transform 0.1s",
+                          transform: isHovered ? "translateY(-1px)" : "none",
+                          boxShadow: isHovered
+                            ? `0 3px 12px rgba(${r},${g},${b},0.45)`
+                            : "none",
+                          outline: isHovered ? `1.5px solid rgba(0,0,0,0.15)` : "none",
+                        }}
+                      >
+                        {displayText}
+                      </span>
+                    </span>
+                  );
+                }
+                return null;
+              });
             })}
           </div>
 
-          {tokens.length === 0 && !error && (
-            <p style={{ color: "#444", fontStyle: "italic" }}>Enter text and saliency values to visualize.</p>
+          {pairs.length === 0 && !error && (
+            <p style={{ color: "#bbb", fontStyle: "italic" }}>Paste your token–value pairs to visualize.</p>
           )}
         </div>
       </div>
